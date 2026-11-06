@@ -1,116 +1,237 @@
+require("dotenv").config({ path: __dirname + "/.env" });
+
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 const db = require("./database");
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
 
-// Validate product details
-function validateProduct(product) {
-    const {
-        name,
-        sku,
-        quantity,
-        costPrice,
-        sellingPrice,
-        threshold
-    } = product;
+// HEALTH CHECK
+app.get("/", (req, res) => {
+    res.send("StockFlow Backend is running!");
+});
 
-    if (typeof name !== "string" || !name.trim()) {
-        return "Product name is required";
+// SIGNUP API
+app.post("/api/auth/signup", async (req, res) => {
+    try {
+        const { name, email, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.status(400).json({
+                error: "Please enter all required fields"
+            });
+        }
+
+        if (password.length < 8) {
+            return res.status(400).json({
+                error: "Password must contain at least 8 characters"
+            });
+        }
+
+        const existingUser = db.prepare(
+            "SELECT id FROM users WHERE email = ?"
+        ).get(email);
+
+        if (existingUser) {
+            return res.status(409).json({
+                error: "Email already registered. Please login."
+            });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        const result = db.prepare(`
+            INSERT INTO users (name, email, password_hash)
+            VALUES (?, ?, ?)
+        `).run(name, email, hashedPassword);
+
+        const user = {
+            id: result.lastInsertRowid,
+            name,
+            email
+        };
+
+        const token = jwt.sign(
+            { id: user.id, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: "1d" }
+        );
+
+        res.status(201).json({
+            message: "Signup successful",
+            token,
+            user
+        });
+
+    } catch (error) {
+        console.error("Signup error:", error);
+        res.status(500).json({ error: "Signup failed" });
     }
+});
 
-    if (typeof sku !== "string" || !sku.trim()) {
-        return "SKU is required";
+// LOGIN API
+app.post("/api/auth/login", async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({
+                error: "Please enter email and password"
+            });
+        }
+
+        const user = db.prepare(
+            "SELECT * FROM users WHERE email = ?"
+        ).get(email);
+
+        if (!user) {
+            return res.status(401).json({
+                error: "Invalid email or password"
+            });
+        }
+
+        const validPassword = await bcrypt.compare(
+            password,
+            user.password_hash
+        );
+
+        if (!validPassword) {
+            return res.status(401).json({
+                error: "Invalid email or password"
+            });
+        }
+
+        const token = jwt.sign(
+            { id: user.id, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: "1d" }
+        );
+
+        res.json({
+            message: "Login successful",
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email
+            }
+        });
+
+    } catch (error) {
+        console.error("Login error:", error);
+        res.status(500).json({ error: "Login failed" });
     }
+});
 
-    if (
-        quantity === undefined ||
-        !Number.isInteger(Number(quantity)) ||
-        Number(quantity) < 0
-    ) {
-        return "Quantity must be a non-negative whole number";
+// GET LOGGED-IN USER
+app.get("/api/auth/me", (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({
+                error: "Authentication token required"
+            });
+        }
+
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        const user = db.prepare(
+            "SELECT id, name, email FROM users WHERE id = ?"
+        ).get(decoded.id);
+
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        res.json({ user });
+
+    } catch (error) {
+        res.status(401).json({
+            error: "Invalid or expired token"
+        });
     }
+});
 
-    if (
-        costPrice !== undefined &&
-        (!Number.isFinite(Number(costPrice)) || Number(costPrice) < 0)
-    ) {
-        return "Cost price must be a non-negative number";
-    }
-
-    if (
-        sellingPrice !== undefined &&
-        (!Number.isFinite(Number(sellingPrice)) || Number(sellingPrice) < 0)
-    ) {
-        return "Selling price must be a non-negative number";
-    }
-
-    if (
-        threshold !== undefined &&
-        (!Number.isInteger(Number(threshold)) || Number(threshold) < 0)
-    ) {
-        return "Threshold must be a non-negative whole number";
-    }
-
-    return null;
-}
-
-// Get all products
+// GET ALL PRODUCTS
 app.get("/api/products", (req, res) => {
     try {
-        const products = db.prepare(`
-            SELECT id, name, sku, description, quantity,
-            costPrice, selling_price AS sellingPrice, threshold
-            FROM products
-        `).all();
+        const products = db.prepare(
+            "SELECT * FROM products ORDER BY id DESC"
+        ).all();
 
-        res.json(products);
+        res.json(products.map(product => ({
+            ...product,
+            sellingPrice: product.selling_price
+        })));
+
     } catch (error) {
+        console.error("Get products error:", error);
         res.status(500).json({ error: "Unable to fetch products" });
     }
 });
 
-// Add product
+// ADD PRODUCT
 app.post("/api/products", (req, res) => {
-    const {
-        name, sku, description, quantity,
-        costPrice, sellingPrice, threshold
-    } = req.body;
-
-    const validationError = validateProduct(req.body);
-
-    if (validationError) {
-        return res.status(400).json({ error: validationError });
-    }
-
     try {
+        const {
+            name,
+            sku,
+            description = "",
+            quantity = 0,
+            costPrice = 0,
+            sellingPrice = 0,
+            threshold = 5
+        } = req.body;
+
+        if (!name || !sku) {
+            return res.status(400).json({
+                error: "Product name and SKU are required"
+            });
+        }
+
+        const status = Number(quantity) <= Number(threshold)
+            ? "Low Stock"
+            : "In Stock";
+
         const result = db.prepare(`
             INSERT INTO products
-            (name, sku, description, quantity,
-            costPrice, selling_price, threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (name, sku, description, quantity, costPrice,
+             selling_price, threshold, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
-            name.trim(),
-            sku.trim(),
-            description || "",
+            name,
+            sku,
+            description,
             Number(quantity),
-            Number(costPrice ?? 0),
-            Number(sellingPrice ?? 0),
-            Number(threshold ?? 5)
+            Number(costPrice),
+            Number(sellingPrice),
+            Number(threshold),
+            status
         );
 
+        const product = db.prepare(
+            "SELECT * FROM products WHERE id = ?"
+        ).get(result.lastInsertRowid);
+
         res.status(201).json({
-            message: "Product added successfully",
-            id: result.lastInsertRowid
+            ...product,
+            sellingPrice: product.selling_price
         });
 
     } catch (error) {
+        console.error("Add product error:", error);
+
         if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
             return res.status(409).json({
-                error: "This SKU already exists"
+                error: "SKU already exists!"
             });
         }
 
@@ -118,49 +239,73 @@ app.post("/api/products", (req, res) => {
     }
 });
 
-// Update product
+// UPDATE PRODUCT
 app.put("/api/products/:id", (req, res) => {
-    const {
-        name, sku, description, quantity,
-        costPrice, sellingPrice, threshold
-    } = req.body;
-
-    const validationError = validateProduct(req.body);
-
-    if (validationError) {
-        return res.status(400).json({ error: validationError });
-    }
-
     try {
-        const result = db.prepare(`
-            UPDATE products
-            SET name = ?, sku = ?, description = ?,
-            quantity = ?, costPrice = ?,
-            selling_price = ?, threshold = ?
-            WHERE id = ?
-        `).run(
-            name.trim(),
-            sku.trim(),
-            description || "",
-            Number(quantity),
-            Number(costPrice ?? 0),
-            Number(sellingPrice ?? 0),
-            Number(threshold ?? 5),
-            req.params.id
-        );
+        const {
+            name,
+            sku,
+            description = "",
+            quantity = 0,
+            costPrice = 0,
+            sellingPrice = 0,
+            threshold = 5
+        } = req.body;
 
-        if (result.changes === 0) {
+        const id = Number(req.params.id);
+
+        const existingProduct = db.prepare(
+            "SELECT * FROM products WHERE id = ?"
+        ).get(id);
+
+        if (!existingProduct) {
             return res.status(404).json({
                 error: "Product not found"
             });
         }
 
-        res.json({ message: "Product updated successfully" });
+        const status = Number(quantity) <= Number(threshold)
+            ? "Low Stock"
+            : "In Stock";
+
+        db.prepare(`
+            UPDATE products
+            SET name = ?,
+                sku = ?,
+                description = ?,
+                quantity = ?,
+                costPrice = ?,
+                selling_price = ?,
+                threshold = ?,
+                status = ?
+            WHERE id = ?
+        `).run(
+            name,
+            sku,
+            description,
+            Number(quantity),
+            Number(costPrice),
+            Number(sellingPrice),
+            Number(threshold),
+            status,
+            id
+        );
+
+        const updatedProduct = db.prepare(
+            "SELECT * FROM products WHERE id = ?"
+        ).get(id);
+
+        res.json({
+            ...updatedProduct,
+            sellingPrice: updatedProduct.selling_price
+        });
 
     } catch (error) {
+        console.error("Update product error:", error);
+
         if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
             return res.status(409).json({
-                error: "This SKU already exists"
+                error: "SKU already exists!"
             });
         }
 
@@ -168,12 +313,14 @@ app.put("/api/products/:id", (req, res) => {
     }
 });
 
-// Delete product
+// DELETE PRODUCT
 app.delete("/api/products/:id", (req, res) => {
     try {
+        const id = Number(req.params.id);
+
         const result = db.prepare(
             "DELETE FROM products WHERE id = ?"
-        ).run(req.params.id);
+        ).run(id);
 
         if (result.changes === 0) {
             return res.status(404).json({
@@ -184,13 +331,26 @@ app.delete("/api/products/:id", (req, res) => {
         res.json({ message: "Product deleted successfully" });
 
     } catch (error) {
+        console.error("Delete product error:", error);
         res.status(500).json({ error: "Unable to delete product" });
     }
 });
 
-// Start server
-const PORT = 5000;
+// API NOT FOUND
+// API NOT FOUND
+app.use((req, res) => {
+    res.status(404).json({
+        error: "API route not found",
+        method: req.method,
+        path: req.originalUrl
+    });
+});
 
+// START SERVER
 app.listen(PORT, () => {
+    console.log("StockFlow Database Connected!");
     console.log(`Server running on port ${PORT}`);
+    console.log("Signup API: POST /api/auth/signup");
+    console.log("Login API: POST /api/auth/login");
+    console.log("Products API: GET /api/products");
 });
